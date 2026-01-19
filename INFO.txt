@@ -1,0 +1,107 @@
+core cache design logic, so let’s explain it simply and clearly.
+
+You’re asking why we use Set and Get functions, instead of directly accessing the cache data.
+
+Why we use Set and Get functions
+
+We use Set and Get to control how data is stored and retrieved, especially when expiration (TTL) is involved.
+
+1️⃣ Why not access the map directly?
+❌ Bad approach
+cache.data["key"] = value
+v := cache.data["key"]
+
+
+Problems:
+
+No expiration handling
+
+No validation
+
+No cleanup of expired items
+
+Hard to add thread safety later
+
+Internal structure is exposed
+
+2️⃣ Why Set exists
+What Set does
+
+Stores the value
+
+Assigns an expiry time
+
+Applies cache rules consistently
+
+Example logic:
+
+func (c *Cache) Set(key string, value string) {
+    c.data[key] = Item{
+        Value:      value,
+        ExpiryTime: time.Now().Add(c.ttl),
+    }
+}
+
+Why this matters
+
+Ensures every item has a TTL
+
+Prevents forgetting expiration logic
+
+Centralizes cache rules in one place
+
+3️⃣ Why Get exists
+What Get does
+
+Checks if the key exists
+
+Verifies the item has not expired
+
+Removes expired items automatically
+
+Returns safe, reliable data
+
+Example logic:
+
+func (c *Cache) Get(key string) (string, bool) {
+    item, ok := c.data[key]
+    if !ok {
+        return "", false
+    }
+
+    if time.Now().After(item.ExpiryTime) {
+        delete(c.data, key)
+        return "", false
+    }
+
+    return item.Value, true
+}
+
+4️⃣ Real-world analogy 🧠
+
+Think of the cache like a refrigerator:
+
+Set → putting food in and labeling it with an expiry date
+
+Get → checking if the food exists and is still fresh
+
+You don’t want to:
+
+Eat expired food
+
+Manually check dates every time
+
+5️⃣ Benefits of using Set and Get
+Benefit	Explanation
+Encapsulation	Internal data is protected
+Consistency	Every item follows TTL rules
+Safety	Expired data is never returned
+Maintainability	Easy to change logic later
+Extensibility	Easy to add locks, logging, metrics
+6️⃣ Why this is idiomatic Go
+
+Go favors explicit behavior
+
+Methods define clear ownership of logic
+
+(value, bool) return pattern avoids ambiguity
