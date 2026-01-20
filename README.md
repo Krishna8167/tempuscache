@@ -1,3 +1,11 @@
+<p align="center">
+  <img 
+    src="https://github.com/user-attachments/assets/0a2442e4-f640-43fb-a2a9-b8d219d1ae51" 
+    alt="TempusCache Logo" 
+    width="380"
+  />
+</p>
+
 # TempusCache
 
 **TempusCache** is a high-performance, in-memory key-value cache designed around **time-aware data lifecycle management**. It supports **per-key TTL (Time-To-Live)**, ensuring automatic expiration of stale entries without external intervention.
