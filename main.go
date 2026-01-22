@@ -35,46 +35,73 @@ type Cache struct {
 	data map[string]Item
 	mu   sync.RWMutex
 	ttl  time.Duration
+	stop chan struct{}
 }
 
 /*
-	Classic In-memory TTL cache pattern in go.
+	Classic in-memory TTL cache pattern in Go.
 
-	1. data map[string]Item :
-		- Key:		String - cache key
-		- Value:	Item   - Stored value + expiration metadata
+	This structure represents a thread-safe, time-based cache with
+	automatic expiration support.
 
-		Note:	map : O(1) average lookup, Perfect for in-memory caches
+	------------------------------------------------------------
+	1. data map[string]Item
+	------------------------------------------------------------
+	- Key:   string — cache key
+	- Value: Item   — stored value + expiration metadata
 
-	2. mu sync.RWMutex:
-		required to make it thread-safe.
-		exclusive for eradicating runtime panics: concurrent map read and map write
+	The built-in map provides O(1) average-time lookups, making it
+	ideal for in-memory caching workloads.
 
-		We use here, RWMutex instead of the Mutex in general :
-		- Sync.RWMutex allows ,
-			- many readers at the same time.
-			- only one writer at a time.
+	------------------------------------------------------------
+	2. mu sync.RWMutex
+	------------------------------------------------------------
+	Used to make the cache safe for concurrent access.
 
-		this matches the cache access patterns:
-			. Reads (Get)			 - are frequent
-			. Writes (Set, Delete )  - less
+	Without synchronization, concurrent reads and writes to a map
+	will cause runtime panics.
 
-	3. ttl time.Duration:
-		this defines the default time-to-live for cache enteries.
+	RWMutex is chosen over Mutex because it better matches cache
+	access patterns:
 
-		Reason:
-		- all items share the same expiration policy
-		- simple API structure(Set(key, value))
-		- Avoids repeating TTL everywhere
+	- Multiple readers can access the cache simultaneously (Get)
+	- Writers (Set, Delete, eviction) acquire exclusive access
 
-	All this will work together when transactions starts.
+	This significantly improves performance under read-heavy loads.
 
-	Modern generic version for go 1.18+ :
+	------------------------------------------------------------
+	3. ttl time.Duration
+	------------------------------------------------------------
+	Defines the default Time-To-Live applied to all cache entries.
+
+	Design rationale:
+	- A single expiration policy keeps the API simple
+	- Callers don’t need to specify TTL on every Set
+	- Centralizes expiration behavior
+
+	------------------------------------------------------------
+	4. stop chan struct{}
+	------------------------------------------------------------
+	Used to signal background goroutines (e.g. eviction workers)
+	to shut down gracefully.
+
+	Closing this channel:
+	- Broadcasts a stop signal to all listeners
+	- Prevents goroutine leaks
+	- Enables clean shutdowns in tests and production
+
+	This is a standard Go pattern for lifecycle management of
+	long-running background processes.
+
+	------------------------------------------------------------
+	Modern generic version (Go 1.18+)
+	------------------------------------------------------------
 
 	type Cache[T any] struct {
 		data map[string]Item[T]
 		mu   sync.RWMutex
 		ttl  time.Duration
+		stop chan struct{}
 	}
 
 */
@@ -160,26 +187,49 @@ func NewCache(ttl time.Duration) *Cache {
 	return &Cache{
 		data: make(map[string]Item),
 		ttl:  ttl,
+		stop: make(chan struct{}),
 	}
 }
 
 /*
-	NewCache is a constructor function that creates and initializes a new cache instance with a default time-to-live (TTL) for cached items.
+	NewCache constructs and initializes a new in-memory TTL cache.
+
+	Parameters:
+	------------------------------------------------------------
 	ttl time.Duration
+		Defines the default Time-To-Live applied to all cache entries.
+		Each item inserted into the cache will automatically expire
+		after this duration.
 
-	Specifies how long each item in the cache remains valid
-		Common examples: 5 * time.Minute, 30 * time.Second
+		Typical values:
+			5 * time.Minute
+			30 * time.Second
 
+	Internal Initialization:
+	------------------------------------------------------------
 	make(map[string]Item)
-		Initializes the internal storage map
-		Prevents nil map runtime panics
-		Allows immediate insertion of items
+		Allocates the internal storage map.
+		This ensures:
+			- O(1) average-time lookups
+			- No nil-map panics
+			- Immediate readiness for inserts
 
-	Returned value: *Cache
-		Returns a pointer to the newly created cache
-		Ensures:
-			Efficient memory usage
-			Shared state when passed around
+	make(chan struct{})
+		Initializes the shutdown signal channel.
+		This channel is used to:
+			- Gracefully stop background goroutines (e.g. eviction worker)
+			- Prevent goroutine leaks
+			- Support clean shutdowns in tests and production
+
+	Return Value:
+	------------------------------------------------------------
+	*Cache
+		Returns a pointer to the initialized cache instance.
+
+		Using a pointer:
+			- Avoids copying internal state (maps, mutexes)
+			- Enables shared access across goroutines
+			- Preserves correctness and performance
 
 */
 
@@ -206,63 +256,119 @@ func (c *Cache) startEviction(interval time.Duration) {
 	ticker := time.NewTicker(interval)
 
 	go func() {
-		//The eviction loop runs in a separate goroutine
-		// This will prevent blocking the main application
-		// Once started, It runs independently for the lifetime of the program (or until stopped).
+		// The eviction loop runs in a dedicated background goroutine.
+		// This prevents eviction work from blocking the main application
+		// and allows cache operations (Get / Set) to continue concurrently.
+		//
+		// The goroutine wakes up periodically based on the provided
+		// interval and removes expired entries from the cache.
+		//
+		// Lifecycle:
+		// - Starts when startEviction is called
+		// - Runs until the stop channel is closed
+		// - Exits cleanly on shutdown to avoid goroutine leaks
+		defer ticker.Stop()
 
-		for range ticker.C {
+		for {
+			select {
+			case <-ticker.C:
+				// Periodic eviction pass
+				now := time.Now()
 
-			// C - channel ; C <-chan Time (Everytime the ticker fires, that delievers a value at that time).
-			now := time.Now()
-
-			c.mu.Lock()
-
-			for key, item := range c.data {
-				if now.After(item.ExpiryTime) {
-					delete(c.data, key)
+				// Acquire exclusive lock since the map is being modified
+				c.mu.Lock()
+				for key, item := range c.data {
+					if now.After(item.ExpiryTime) {
+						delete(c.data, key)
+					}
 				}
-			}
+				c.mu.Unlock()
 
-			c.mu.Unlock()
+			case <-c.stop:
+				// Shutdown signal received
+				// Exit the goroutine gracefully
+				return
+			}
 		}
 	}()
 }
 
 /*
+	startEviction starts a background eviction worker that periodically
+	removes expired entries from the cache.
 
-This function starts a background eviction routine that periodically removes expired entries from the cache.
-	A time.Ticker triggers at the given interval, and each tick runs in a separate goroutine so it doesn’t block the main program.
-	On every tick, the cache is locked for thread safety, the current time is compared against each item’s ExpiryTime, and any expired entries are deleted before unlocking the cache again.
+	A time.Ticker triggers at the specified interval. On each tick, the
+	worker scans the cache and deletes items whose ExpiryTime has passed.
+
+	Concurrency & Safety:
+	- The eviction logic runs in its own goroutine and never blocks
+	  the main application.
+	- An exclusive lock is acquired while modifying the cache to
+	  ensure thread-safe access to the underlying map.
+
+	Lifecycle Management:
+	- The worker starts when startEviction is called.
+	- It listens on the stop channel for shutdown signals.
+	- When the stop channel is closed, the goroutine exits cleanly,
+	  preventing goroutine leaks.
 
 	IN BRIEF:
-	It ensures automatic, thread-safe cleanup of expired cache items at regular intervals.
-
+	Provides automatic, thread-safe, and gracefully stoppable cleanup
+	of expired cache entries at regular intervals.
 */
+
 /*
+	startEviction starts a background eviction worker that periodically
+	removes expired entries from the cache.
 
-for: v1.0.0 : For CRUD Ops with Cache memory
+	A time.Ticker triggers at the specified interval. On each tick, the
+	worker scans the cache and deletes items whose ExpiryTime has passed.
 
-func main() {
-	cache := NewCache(5 * time.Second)
+	Concurrency & Safety:
+	- The eviction logic runs in its own goroutine and never blocks
+	  the main application.
+	- An exclusive lock is acquired while modifying the cache to
+	  ensure thread-safe access to the underlying map.
 
-	cache.Set("name", "krishna")
+	Lifecycle Management:
+	- The worker starts when startEviction is called.
+	- It listens on the stop channel for shutdown signals.
+	- When the stop channel is closed, the goroutine exits cleanly,
+	  preventing goroutine leaks.
 
-	if val, ok := cache.Get("name"); ok {
-		fmt.Println("Found:", val)
-	}
+	IN BRIEF:
+	Provides automatic, thread-safe, and gracefully stoppable cleanup
+	of expired cache entries at regular intervals.
+*/
 
-	time.Sleep(6 * time.Second)
-
-	if _, ok := cache.Get("name"); !ok {
-		fmt.Println("Expired")
-	}
+func (c *Cache) Stop() {
+	close(c.stop)
 }
 
+/*
+	Stop gracefully shuts down all background workers associated
+	with the cache.
+
+	Behavior:
+	- Closes the stop channel to broadcast a shutdown signal.
+	- Unblocks any goroutines listening for the stop signal
+	  (e.g. the eviction worker).
+	- Allows in-flight work to exit cleanly.
+
+	Guarantees:
+	- Prevents goroutine leaks.
+	- Safe to call once during cache teardown.
+	- Intended to be used during application shutdown,
+	  test cleanup, or controlled lifecycle management.
+
+	Note:
+	Calling Stop more than once will cause a panic due to
+	closing an already-closed channel. It should be invoked
+	exactly once by the cache owner.
 */
 
 func main() {
 	cache := NewCache(5 * time.Second)
-
 	cache.startEviction(2 * time.Second)
 
 	cache.Set("name", "krishna")
@@ -273,8 +379,6 @@ func main() {
 		fmt.Println("Expired (Cleaned by eviction workflow)")
 	}
 
-	cache.Set("age", 24)
-	time.Sleep(3 * time.Second)
-	cache.Set("city", "Bangalore")
+	cache.Stop()
 
 }
