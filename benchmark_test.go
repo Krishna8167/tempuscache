@@ -1,6 +1,7 @@
 package tempuscache
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -54,5 +55,45 @@ func BenchmarkSet(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		cache.Set("key", "value", 5*time.Second)
+	}
+}
+
+func BenchmarkSetUnique(b *testing.B) {
+	cache := New(WithMaxEntries(b.N + 1))
+
+	for i := 0; i < b.N; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), i, 0)
+	}
+}
+
+func BenchmarkGet(b *testing.B) {
+	cache := New()
+
+	cache.Set("key", "value", 0)
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		cache.Get("key")
+	}
+}
+
+func BenchmarkParallelGet(b *testing.B) {
+	cache := New()
+
+	cache.Set("key", "value", 0)
+
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			cache.Get("key")
+		}
+	})
+}
+
+func BenchmarkEviction(b *testing.B) {
+	cache := New(WithMaxEntries(100))
+
+	for i := 0; i < b.N; i++ {
+		cache.Set(fmt.Sprintf("key%d", i), i, 0)
 	}
 }

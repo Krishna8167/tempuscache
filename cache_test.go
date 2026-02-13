@@ -7,39 +7,56 @@ import (
 )
 
 /*
-cache_test.go validates the correctness, reliability,
-and concurrency safety of the TempusCache implementation.
+cache_test.go provides comprehensive validation of TempusCache.
 
-TEST COVERAGE
+================================================================================
+TESTING OBJECTIVES
+================================================================================
 
-1. Basic correctness:
-   Ensures Set() and Get() behave as expected.
+This test suite verifies:
 
-2. TTL behavior:
-   Validates that keys expire correctly when TTL elapses.
+1. Functional Correctness
+   - Ensures Set(), Get(), Delete() behave deterministically.
+   - Confirms LRU updates do not break key retrieval.
 
-3. No-expiration behavior:
-   Confirms that TTL == 0 results in persistent entries.
+2. Expiration Semantics
+   - Validates TTL-based expiration accuracy.
+   - Ensures expired keys are never returned.
+   - Confirms TTL == 0 results in non-expiring entries.
 
-4. Explicit deletion:
-   Verifies Delete() removes keys safely.
+3. Concurrency Safety
+   - Stress-tests concurrent read/write access.
+   - Validates correct usage of sync.RWMutex.
+   - Ensures absence of race conditions and runtime panics.
 
-5. Concurrency safety:
-   Stress-tests the cache under concurrent read/write access
-   to ensure no race conditions or runtime panics occur.
+4. Metrics Accuracy
+   - Verifies hit/miss statistics tracking.
 
-NOTE ON PARALLEL EXECUTION
+================================================================================
+CONCURRENCY VALIDATION
+================================================================================
 
-Parallel execution depends on CPU core availability.
-Goroutines may run concurrently (multi-core) or interleave
-(multi-tasking on single core), but correctness must hold
-in both cases.
+Concurrency tests are designed to simulate realistic parallel workloads.
 
-These tests should be executed with:
+Execution correctness must hold regardless of:
+
+- True parallel execution (multi-core CPUs)
+- Goroutine interleaving (single-core scheduling)
+
+For full safety verification, tests should be executed with:
 
     go test -race
 
-to ensure no data races are present.
+The Go race detector ensures no data races occur
+under concurrent access patterns.
+
+================================================================================
+ENGINEERING PHILOSOPHY
+================================================================================
+
+The goal of this suite is not only correctness,
+but reliability under contention — a core requirement
+for production-grade caching systems.
 */
 
 func TestSetAndGet(t *testing.T) {
@@ -95,26 +112,44 @@ func TestDelete(t *testing.T) {
 }
 
 /*
-TestConcurrentAccess performs a concurrency stress test.
+TestConcurrentAccess performs a concurrency stress validation.
 
+================================================================================
 PURPOSE
+================================================================================
 
-- Simulates multiple goroutines accessing the cache simultaneously.
-- Validates correctness of sync.RWMutex usage.
-- Ensures no concurrent map write panic occurs.
-- Verifies system stability under parallel workload.
+This test ensures:
 
-MECHANISM
+- Thread safety under simultaneous Set() and Get() operations.
+- No "concurrent map writes" runtime panic.
+- Correct synchronization via sync.RWMutex.
+- Stability under write-read contention.
 
-A sync.WaitGroup is used to wait for all goroutines to finish.
-Each goroutine:
-    1. Performs a write (Set)
-    2. Performs a read (Get)
+================================================================================
+EXECUTION MODEL
+================================================================================
 
-This creates realistic read/write contention.
+- 100 goroutines are spawned.
+- Each goroutine performs:
+    1. A write operation (Set)
+    2. A read operation (Get)
 
-If the mutex protection were incorrect,
-this test would likely panic or fail under race detection.
+A sync.WaitGroup coordinates completion to ensure
+all goroutines finish before the test exits.
+
+================================================================================
+WHY THIS MATTERS
+================================================================================
+
+If locking were implemented incorrectly,
+this test would likely:
+
+- Trigger race detector warnings
+- Cause runtime panic
+- Produce inconsistent state
+
+Passing this test under `go test -race`
+provides strong confidence in concurrency correctness.
 */
 
 func TestConcurrentAccess(t *testing.T) {
@@ -132,6 +167,22 @@ func TestConcurrentAccess(t *testing.T) {
 
 	wg.Wait() // ENsures all goroutines cpmpletes before test exits.
 }
+
+/*
+TestStatsTracking verifies accuracy of runtime metrics.
+
+It ensures:
+
+- Cache hits increment correctly on successful retrieval.
+- Cache misses increment correctly on failed lookup.
+- Stats() returns a consistent snapshot under read lock.
+
+Accurate statistics are critical for:
+
+- Performance monitoring
+- Observability
+- Production diagnostics
+*/
 
 func TestStatsTracking(t *testing.T) {
 	cache := New()

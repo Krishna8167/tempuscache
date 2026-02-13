@@ -7,32 +7,71 @@ import (
 )
 
 /*
-Cache represents a concurrent in-memory key-value store with optional TTL support.
+Cache implements a thread-safe, in-memory key-value store with:
 
-DESIGN PRINCIPLES
+- Per-key TTL (Time-To-Live)
+- LRU (Least Recently Used) eviction
+- Active + Lazy expiration
+- Configurable capacity limits
+- Runtime statistics tracking
 
-1. Thread Safety:
-   The internal map is protected using sync.RWMutex to allow safe
-   concurrent reads and writes.
+================================================================================
+ARCHITECTURAL OVERVIEW
+================================================================================
 
-2. TTL Support:
-   Each key can have an independent expiration time. Expiration
-   metadata is stored inside the Item struct.
+TempusCache combines two core data structures:
 
-3. Dual Expiration Strategy:
-   - Lazy expiration: Expired items are checked and removed during Get().
-   - Active expiration: A background janitor periodically scans and removes expired keys.
+1. Hash Map (map[string]*list.Element)
+   - Provides O(1) key lookup.
+   - Maps keys to their corresponding LRU list elements.
 
-4. Extensibility:
-   The cache is configured using the functional options pattern,
-   allowing new configuration parameters without breaking the API.
+2. Doubly Linked List (*list.List)
+   - Maintains LRU ordering.
+   - Most recently used items are moved to the front.
+   - Oldest items remain at the back for eviction.
 
-STRUCTURE
+================================================================================
+CONCURRENCY MODEL
+================================================================================
 
-data     -> Primary storage map (key -> Item)
-mu       -> Read-write mutex for concurrency control
-interval -> Cleanup interval for background janitor
-stopChan -> Signal channel to gracefully stop background cleanup
+- sync.RWMutex protects all shared state.
+- Write operations use Lock().
+- Read-only operations use RLock().
+- Internal modifications (LRU movement, expiration cleanup) are performed
+  under exclusive locking to prevent race conditions.
+
+This guarantees safe usage in highly concurrent, multi-goroutine environments.
+
+================================================================================
+EXPIRATION STRATEGY
+================================================================================
+
+TempusCache uses a dual expiration model:
+
+1. Lazy Expiration
+   - Expired keys are removed during Get() operations.
+   - Ensures expired data is never returned to callers.
+
+2. Active Expiration
+   - A background janitor periodically scans and removes expired entries.
+   - Prevents memory buildup from stale keys.
+
+================================================================================
+STRUCTURE FIELDS
+================================================================================
+
+data       -> Primary storage map (key → *list.Element)
+lru        -> Doubly linked list maintaining LRU ordering
+mu         -> Read-write mutex for concurrency control
+maxEntries -> Maximum allowed entries before LRU eviction
+interval   -> Background cleanup interval
+stopChan   -> Graceful shutdown signal for janitor goroutine
+stats      -> Cache performance metrics (hits/misses)
+
+The design prioritizes:
+- Predictable performance
+- Deterministic eviction behavior
+- Minimal memory overhead
 */
 
 type Cache struct {
@@ -47,12 +86,22 @@ type Cache struct {
 }
 
 /*
-New creates and initializes a new Cache instance.
+New initializes and returns a configured Cache instance.
 
-It applies all provided functional options before starting
-the background janitor.
+CONFIGURATION MODEL:
+Uses the functional options pattern to allow extensible configuration
+without modifying the constructor signature.
 
-If no cleanup interval is configured, the janitor will not start.
+INITIALIZATION STEPS:
+1. Allocate internal map.
+2. Initialize LRU list.
+3. Create stop channel for graceful shutdown.
+4. Apply user-provided options.
+5. Start background janitor (if cleanup interval is set).
+
+If no cleanup interval is configured, the janitor will not run.
+
+This pattern ensures forward compatibility and API stability.
 */
 
 func New(opts ...Option) *Cache {
@@ -75,16 +124,32 @@ func New(opts ...Option) *Cache {
 Set inserts or updates a key in the cache.
 
 PARAMETERS:
-- key   : unique identifier
-- value : any data type (stored as interface{})
-- ttl   : time-to-live duration
+- key   : Unique identifier
+- value : Arbitrary data (stored as interface{})
+- ttl   : Time-To-Live duration
 
 BEHAVIOR:
-- If ttl > 0, expiration timestamp is calculated.
-- If ttl <= 0, the item does not expire.
-- Write access is protected using Lock().
 
-Expiration is stored as UnixNano for fast numeric comparison.
+1. If key already exists:
+   - Update its value.
+   - Recalculate expiration (if ttl > 0).
+   - Move item to front of LRU list.
+
+2. If key does not exist:
+   - If maxEntries limit is reached → evict oldest entry (LRU policy).
+   - Create new Item with optional expiration timestamp.
+   - Insert at front of LRU list.
+   - Store reference in map.
+
+TTL IMPLEMENTATION:
+Expiration time is stored as UnixNano (int64) for:
+- Fast numeric comparison
+- Reduced object overhead
+
+TIME COMPLEXITY:
+O(1) average case
+
+This operation is fully protected by exclusive locking to ensure consistency.
 */
 
 func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
@@ -124,19 +189,39 @@ func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
 Get retrieves a value from the cache.
 
 RETURNS:
-- value (interface{})
-- boolean indicating whether the key exists and is valid
+- (interface{}, true)  -> If key exists and is not expired
+- (nil, false)         -> If key does not exist or is expired
 
-BEHAVIOR:
-1. Uses RLock() for read access.
-2. If key not found -> returns (nil, false).
-3. If found but expired:
-   - Removes the key using Lock().
-   - Returns (nil, false).
-4. Otherwise returns stored value.
+EXECUTION FLOW:
 
-This implements lazy expiration to ensure expired values
-are never returned to callers.
+1. Lookup key in O(1) using map.
+2. If not found:
+   - Increment Miss counter.
+   - Return immediately.
+
+3. If found:
+   - Check expiration (lazy expiration).
+   - If expired:
+       - Remove element from LRU + map.
+       - Increment Miss counter.
+       - Return false.
+
+4. If valid:
+   - Move item to front of LRU (mark as recently used).
+   - Increment Hit counter.
+   - Return value.
+
+LRU UPDATE:
+Every successful access updates recency ordering,
+ensuring accurate eviction decisions.
+
+TIME COMPLEXITY:
+O(1) average case
+
+This method acquires exclusive Lock() because it may:
+- Modify LRU ordering
+- Remove expired entries
+- Update statistics
 */
 
 func (c *Cache) Get(key string) (interface{}, bool) {
@@ -163,10 +248,19 @@ func (c *Cache) Get(key string) (interface{}, bool) {
 }
 
 /*
-   Delete removes a key from the cache.
+Delete removes a key from the cache.
 
-   Write access is protected using Lock().
-   If the key does not exist, delete is safely ignored.
+BEHAVIOR:
+- If key exists → remove from map.
+- If key does not exist → operation is safely ignored.
+
+This operation does not panic on missing keys.
+
+CONCURRENCY:
+Uses exclusive locking to ensure safe mutation of shared state.
+
+TIME COMPLEXITY:
+O(1) average case
 */
 
 func (c *Cache) Delete(key string) {
@@ -182,17 +276,25 @@ func (c *Cache) Stats() Stats {
 }
 
 /*
-deleteExpired scans the entire map and removes expired entries.
+deleteExpired performs active expiration by scanning the LRU list
+and removing expired entries.
 
-This function is called by the background janitor at configured intervals.
+This method is invoked by the background janitor at configured intervals.
+
+ALGORITHM:
+- Iterate from the back (oldest entries).
+- Check expiration status.
+- Remove expired elements using removeElement().
 
 TIME COMPLEXITY:
-O(n) — full scan of map
+O(n) — full scan of entries.
 
 CONCURRENCY:
-Acquires exclusive Lock() since it modifies the map.
+Acquires exclusive Lock() since it mutates internal structures.
 
-This is part of the active expiration strategy.
+DESIGN RATIONALE:
+Active expiration prevents memory accumulation from expired keys
+that are not accessed frequently enough to trigger lazy deletion.
 */
 
 func (c *Cache) deleteExpired() {

@@ -5,73 +5,116 @@ import (
 )
 
 /*
-Option defines a functional configuration modifier for Cache.
+Option represents a functional configuration modifier for Cache.
 
-DESIGN PATTERN:
+================================================================================
+DESIGN PATTERN: FUNCTIONAL OPTIONS
+================================================================================
 
-This file implements the Functional Options Pattern, a common
-idiomatic Go design used for flexible and extensible configuration.
+TempusCache uses the Functional Options Pattern — an idiomatic Go
+approach for flexible and future-proof configuration.
 
-Instead of passing multiple parameters to the constructor,
-New() accepts a variadic list of Option functions:
+Instead of passing multiple constructor parameters, New() accepts
+a variadic list of Option functions:
 
     cache := New(
         WithCleanupInterval(10 * time.Second),
     )
 
-Each Option modifies the Cache instance before it becomes active.
+Each Option is a function that mutates the Cache instance
+during initialization.
 
-BENEFITS
+================================================================================
+WHY THIS PATTERN?
+================================================================================
 
-1. API Stability:
-   Adding new configuration options does not change the New() signature.
+1. API STABILITY
+   - Adding new configuration fields does not change the New() signature.
+   - Prevents breaking changes.
 
-2. Readability:
-   Configuration is self-documenting and explicit.
+2. READABILITY
+   - Configuration is explicit and self-documenting.
+   - Avoids confusing positional constructor arguments.
 
-3. Extensibility:
-   Future features (e.g., max capacity, eviction policy, logging)
-   can be added without breaking existing code.
+3. EXTENSIBILITY
+   - New features (e.g., capacity limits, eviction strategies,
+     metrics hooks, logging integrations) can be added seamlessly.
 
-Each Option is simply a function that mutates the Cache struct.
+4. COMPOSABILITY
+   - Multiple options can be combined in a clear and modular way.
+
+================================================================================
+ENGINEERING PHILOSOPHY
+================================================================================
+
+The constructor remains minimal and stable,
+while configuration logic remains modular and isolated.
+
+This pattern is widely used in production Go libraries
+for long-term maintainability.
 */
 
 type Option func(*Cache)
 
 /*
-WithCleanupInterval configures the background cleanup frequency.
+WithCleanupInterval configures the active expiration frequency.
 
-PARAMETER:
-- d: time.Duration specifying how often expired entries
-     should be removed.
+================================================================================
+PARAMETER
+================================================================================
 
-BEHAVIOR:
+d (time.Duration):
+    Interval at which the background janitor scans
+    and removes expired entries.
+
+================================================================================
+BEHAVIOR
+================================================================================
 
 If d > 0:
-    - The janitor goroutine will run every d duration.
-    - Expired items will be actively removed.
+    - A background janitor goroutine is started.
+    - Expired entries are periodically removed.
+    - Enables active expiration strategy.
 
 If d <= 0:
-    - The janitor will not start.
-    - The cache will rely solely on lazy expiration during Get().
+    - The janitor is disabled.
+    - The cache relies solely on lazy expiration during Get().
 
-This option enables fine-grained control over memory cleanup behavior
-and performance trade-offs.
-
-PERFORMANCE CONSIDERATION:
+================================================================================
+PERFORMANCE TRADE-OFFS
+================================================================================
 
 Short intervals:
-    - More frequent cleanup
-    - Higher CPU usage
-    - Lower memory retention of expired entries
+    - Faster cleanup of expired entries
+    - Increased CPU usage due to frequent scans
 
 Long intervals:
-    - Less CPU usage
-    - Expired items may remain longer in memory
+    - Lower CPU overhead
+    - Expired items may occupy memory longer
+
+================================================================================
+SYSTEM DESIGN CONSIDERATION
+================================================================================
+
+Choosing an appropriate cleanup interval depends on:
+
+- Cache size
+- TTL distribution
+- Memory sensitivity
+- Throughput requirements
+
+This option provides operational control over
+the balance between performance and memory efficiency.
 */
 
 func WithCleanupInterval(d time.Duration) Option {
 	return func(c *Cache) {
 		c.interval = d
+	}
+}
+
+func WithMaxEntries(n int) Option {
+	return func(c *Cache) {
+		c.maxEntries = n
 	}
 }

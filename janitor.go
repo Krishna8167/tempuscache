@@ -3,43 +3,75 @@ package tempuscache
 import "time"
 
 /*
-startJanitor launches a background cleanup goroutine responsible
-for periodically removing expired items from the cache.
+startJanitor initializes and launches the background expiration worker.
 
-PURPOSE
+================================================================================
+ROLE IN CACHE LIFECYCLE
+================================================================================
 
-The janitor implements the active expiration strategy.
-While lazy expiration ensures expired items are never returned,
-the janitor ensures memory is reclaimed even if expired keys
-are never accessed again.
+TempusCache implements a dual-expiration strategy:
 
-BEHAVIOR
+1. Lazy Expiration
+   - Expired keys are removed during Get() calls.
 
-1. If cleanup interval <= 0:
-   - The janitor is disabled.
-   - The cache relies entirely on lazy expiration.
+2. Active Expiration (Janitor)
+   - Periodically scans and removes expired entries,
+     even if they are never accessed again.
 
-2. If cleanup interval > 0:
-   - A time.Ticker is created with the specified interval.
-   - A goroutine is launched.
-   - On every tick, deleteExpired() is executed.
+The janitor ensures bounded memory growth in workloads
+where expired keys are rarely read.
 
-CONCURRENCY MODEL
+================================================================================
+EXECUTION MODEL
+================================================================================
 
-- deleteExpired() acquires an exclusive Lock() since it modifies the map.
-- The goroutine runs independently of caller threads.
-- stopChan is used to gracefully terminate the goroutine.
+- If interval <= 0:
+    → Active cleanup is disabled.
+    → Cache relies solely on lazy expiration.
 
-RESOURCE MANAGEMENT
+- If interval > 0:
+    → A time.Ticker is created.
+    → A dedicated goroutine is launched.
+    → On each tick:
+          deleteExpired() is executed.
 
-The ticker is stopped before the goroutine exits to prevent
-resource leakage.
+The goroutine runs independently of caller threads
+and operates asynchronously.
 
-TIME COMPLEXITY
+================================================================================
+CONCURRENCY & SAFETY
+================================================================================
 
-Each cleanup cycle performs a full scan of the map (O(n)).
-This is acceptable for moderate sizes but may require optimization
-(e.g., heap scheduling or sharding) for very large datasets.
+- deleteExpired() acquires an exclusive Lock()
+  because it mutates internal structures.
+
+- stopChan is used as a lifecycle control signal
+  for graceful shutdown.
+
+- The ticker is explicitly stopped before exit
+  to prevent resource leakage.
+
+================================================================================
+PERFORMANCE CHARACTERISTICS
+================================================================================
+
+Each cleanup cycle performs an O(n) scan
+over cache entries (via LRU traversal).
+
+This approach is acceptable for moderate cache sizes.
+For large-scale systems, further optimization strategies
+could include:
+
+- Min-heap scheduling by expiration
+- Time-wheel algorithms
+- Sharded expiration workers
+
+================================================================================
+DESIGN PHILOSOPHY
+================================================================================
+
+The janitor is intentionally simple and predictable,
+favoring clarity and correctness over premature optimization.
 */
 
 func (c *Cache) startJanitor() {
@@ -63,22 +95,43 @@ func (c *Cache) startJanitor() {
 }
 
 /*
-Stop gracefully terminates the background janitor.
+Stop gracefully terminates the background janitor goroutine.
 
-BEHAVIOR
+================================================================================
+SHUTDOWN MECHANISM
+================================================================================
 
-- Closing stopChan signals the janitor goroutine to exit.
-- The goroutine stops the ticker before returning.
-- This prevents memory leaks and dangling timers.
+- Closing stopChan signals the janitor to exit.
+- The goroutine responds by:
+    1. Stopping the ticker.
+    2. Returning cleanly.
 
-IMPORTANT NOTE
+This prevents:
 
-Stop should ideally be called once per cache lifecycle.
-Calling Stop multiple times will panic because a closed
-channel cannot be closed again.
+- Goroutine leaks
+- Ticker resource leaks
+- Background CPU usage after cache disposal
 
-This method allows controlled shutdown in long-running
-applications such as servers or background workers.
+================================================================================
+USAGE CONTRACT
+================================================================================
+
+Stop should be called once per Cache lifecycle.
+
+IMPORTANT:
+Calling Stop multiple times will cause a panic,
+since closing an already closed channel is illegal in Go.
+
+================================================================================
+WHY THIS MATTERS
+================================================================================
+
+In long-running applications (e.g., HTTP servers,
+microservices, background workers), failing to stop
+background routines can lead to subtle resource leaks.
+
+This method enables safe integration into
+production-grade systems.
 */
 
 func (c *Cache) Stop() {
