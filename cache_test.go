@@ -132,3 +132,22 @@ func TestConcurrentAccess(t *testing.T) {
 
 	wg.Wait() // ENsures all goroutines cpmpletes before test exits.
 }
+
+func TestStatsTracking(t *testing.T) {
+	cache := New()
+
+	cache.Set("a", 1, 0)
+
+	cache.Get("a") // hit
+	cache.Get("b") // miss
+
+	stats := cache.Stats()
+
+	if stats.Hits != 1 {
+		t.Fatalf("expected 1 hit, got %d", stats.Hits)
+	}
+
+	if stats.Misses != 1 {
+		t.Fatalf("expected 1 miss, got %d", stats.Misses)
+	}
+}

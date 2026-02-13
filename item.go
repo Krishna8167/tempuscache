@@ -39,6 +39,7 @@ This structure keeps the cache lightweight and efficient.
 */
 
 type Item struct {
+	key        string
 	value      interface{} //Atomic unit of storage in cache.
 	expiration int64       //stored UnixNano Meaning: Number of nanoseconds since January 1, 1970 UTC (Unix epoch).
 }
@@ -80,7 +81,7 @@ The method uses a value receiver because:
 - Keeps implementation simple and idiomatic
 */
 
-func (i Item) Expired() bool {
+func (i *Item) Expired() bool {
 	if i.expiration == 0 {
 		return false
 	}

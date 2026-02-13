@@ -1,6 +1,7 @@
 package tempuscache
 
 import (
+	"container/list"
 	"sync"
 	"time"
 )
@@ -35,10 +36,13 @@ stopChan -> Signal channel to gracefully stop background cleanup
 */
 
 type Cache struct {
-	data     map[string]Item
-	mu       sync.RWMutex
-	interval time.Duration
-	stopChan chan struct{}
+	data       map[string]*list.Element
+	lru        *list.List //where each element stores an Item.
+	mu         sync.RWMutex
+	maxEntries int
+	interval   time.Duration
+	stopChan   chan struct{}
+	stats      Stats
 	// graceful shutdown pattern, and struct{} uses zero memory.
 }
 
@@ -53,7 +57,8 @@ If no cleanup interval is configured, the janitor will not start.
 
 func New(opts ...Option) *Cache {
 	c := &Cache{
-		data:     make(map[string]Item),
+		data:     make(map[string]*list.Element),
+		lru:      list.New(),
 		stopChan: make(chan struct{}),
 	}
 
@@ -83,23 +88,36 @@ Expiration is stored as UnixNano for fast numeric comparison.
 */
 
 func (c *Cache) Set(key string, value interface{}, ttl time.Duration) {
-	var expiration int64
-	/*
-		 	faster comparison than time.Time
-			Avoid time object overhead
-			UnixNano is monotonic numeric.
-	*/
-
-	if ttl > 0 {
-		expiration = time.Now().Add(ttl).UnixNano()
-	}
-
 	c.mu.Lock()
-	c.data[key] = Item{
-		value:      value,
-		expiration: expiration,
+	defer c.mu.Unlock()
+
+	if elem, found := c.data[key]; found {
+		item := elem.Value.(*Item)
+		item.value = value
+		if ttl > 0 {
+			item.expiration = time.Now().Add(ttl).UnixNano()
+		}
+		c.lru.MoveToFront(elem)
+		return
 	}
-	c.mu.Unlock()
+
+	if c.maxEntries > 0 && c.lru.Len() >= c.maxEntries {
+		c.evictOldest()
+	}
+
+	var exp int64
+	if ttl > 0 {
+		exp = time.Now().Add(ttl).UnixNano()
+	}
+
+	item := &Item{
+		key:        key,
+		value:      value,
+		expiration: exp,
+	}
+
+	elem := c.lru.PushFront(item)
+	c.data[key] = elem
 }
 
 /*
@@ -122,36 +140,45 @@ are never returned to callers.
 */
 
 func (c *Cache) Get(key string) (interface{}, bool) {
-	// only reading So , RLock()
-	c.mu.RLock()
-	item, found := c.data[key]
-	c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
+	elem, found := c.data[key]
 	if !found {
+		c.stats.Misses++
 		return nil, false
 	}
+
+	item := elem.Value.(*Item)
 
 	if item.Expired() {
-		c.mu.Lock()
-		delete(c.data, key)
-		c.mu.Unlock()
+		c.removeElement(elem)
+		c.stats.Misses++
 		return nil, false
 	}
 
-	/*
-	   Delete removes a key from the cache.
-
-	   Write access is protected using Lock().
-	   If the key does not exist, delete is safely ignored.
-	*/
-
+	c.lru.MoveToFront(elem)
+	c.stats.Hits++
 	return item.value, true
 }
+
+/*
+   Delete removes a key from the cache.
+
+   Write access is protected using Lock().
+   If the key does not exist, delete is safely ignored.
+*/
 
 func (c *Cache) Delete(key string) {
 	c.mu.Lock()
 	delete(c.data, key)
 	c.mu.Unlock()
+}
+
+func (c *Cache) Stats() Stats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.stats
 }
 
 /*
@@ -172,9 +199,12 @@ func (c *Cache) deleteExpired() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	for key, item := range c.data {
+	for elem := c.lru.Back(); elem != nil; {
+		prev := elem.Prev()
+		item := elem.Value.(*Item)
 		if item.Expired() {
-			delete(c.data, key)
+			c.removeElement(elem)
 		}
+		elem = prev
 	}
 }
